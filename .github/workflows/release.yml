@@ -56,12 +56,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
           # Since rust 1.72, some platforms are tier 3
-          toolchain: 1.88
-          default: true
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
       - name: Install OpenSSL
         if: matrix.os == 'ubuntu-latest'
@@ -71,9 +70,6 @@ jobs:
         run: brew install openssl@3
 
       # Native build
-      - name: Install target
-        if: matrix.cross == false
-        run: rustup target add ${{ matrix.target }}
       - name: Run tests
         if: matrix.cross == false
         run: cargo test --release --target ${{ matrix.target }} --verbose
@@ -97,7 +93,7 @@ jobs:
         continue-on-error: true
         # Disable upx for mips. See https://github.com/upx/upx/issues/387
         if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'mips')
-        uses: crazy-max/ghaction-upx@v1
+        uses: crazy-max/ghaction-upx@v3
         with:
           version: v4.0.2
           files: target/${{ matrix.target }}/release/${{ matrix.exe }}
@@ -109,7 +105,7 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.exe }}
 
       - name: Zip Release
-        uses: TheDoctor0/zip-release@0.6.1
+        uses: TheDoctor0/zip-release@0.7.6
         with:
           type: zip
           filename: forwarder-${{ matrix.target }}.zip
