@@ -10,6 +10,7 @@ use rand::Rng;
 use self_github_update_enhanced::{backends::github, cargo_crate_version};
 use tokio::sync::Mutex;
 use tokio::time::{interval, sleep, timeout};
+use tokio::task::JoinHandle;
 use netcheck::NetworkMonitor;
 
 mod reporter;
@@ -30,6 +31,8 @@ const MAX_RETRY_INTERVAL: u64 = 300; // 5 minutes max interval
 struct ForwarderState {
     ssh_client: Option<client::Client>,
     cockpit_client: Option<client::Client>,
+    ssh_task: Option<JoinHandle<()>>,
+    cockpit_task: Option<JoinHandle<()>>,
     forward_info: ForwardInfo,
     server_address: String,
 }
@@ -58,6 +61,8 @@ async fn main() -> Result<()> {
         let state = Arc::new(Mutex::new(ForwarderState {
             ssh_client: None,
             cockpit_client: None,
+            ssh_task: None,
+            cockpit_task: None,
             forward_info: ForwardInfo {
                 client_country: current_country_code,
                 app_version: cargo_crate_version!().parse()?,
@@ -79,7 +84,6 @@ async fn main() -> Result<()> {
         // Network status tracking
         let network_status = Arc::new(Mutex::new(true)); // Assume network is initially available
         let network_status_for_monitor = Arc::clone(&network_status);
-        let network_status_for_main = Arc::clone(&network_status);
 
         // Start network monitoring
         let state_for_network = Arc::clone(&state);
@@ -123,14 +127,25 @@ async fn main() -> Result<()> {
                         if let Ok(current_country) = get_current_country().await {
                             let mut state = state_for_network.lock().await;
                             state.forward_info.client_country = current_country.country.clone();
+                            let old_server = state.server_address.clone();
                             if current_country.country != "CN" {
                                 state.server_address = FORWARD_JP_SERVER.to_string();
                             } else {
                                 state.server_address = FORWARD_SERVER.to_string();
                             }
+                            
+                            if old_server != state.server_address {
+                                println!("Server changed from {} to {}", old_server, state.server_address);
+                            }
+                            drop(state);
                         }
 
-                        let _ = reconnect_clients(Arc::clone(&state_for_network)).await;
+                        println!("Starting reconnection process...");
+                        match reconnect_clients(Arc::clone(&state_for_network)).await {
+                            Ok(true) => println!("Reconnection successful"),
+                            Ok(false) => eprintln!("Reconnection failed"),
+                            Err(e) => eprintln!("Reconnection error: {:?}", e),
+                        }
                     }
                 }
             }
@@ -149,6 +164,9 @@ async fn main() -> Result<()> {
 }
 
 async fn initialize_connections(state: Arc<Mutex<ForwarderState>>) -> Result<bool> {
+    // First, stop any existing connections
+    stop_existing_connections(Arc::clone(&state)).await;
+
     let mut state_guard = state.lock().await;
     let server_address = state_guard.server_address.clone();
 
@@ -185,33 +203,57 @@ async fn initialize_connections(state: Arc<Mutex<ForwarderState>>) -> Result<boo
                     let ssh_client = state_guard.ssh_client.take().unwrap();
                     let cockpit_client = state_guard.cockpit_client.take().unwrap();
 
-                    drop(state_guard); // Release the lock before spawning tasks
-
-                    tokio::spawn(async move {
+                    // Spawn the listening tasks and store their handles
+                    let ssh_task = tokio::spawn(async move {
                         if let Err(e) = ssh_client.listen().await {
                             eprintln!("SSH forward error: {:?}", e);
                         }
                     });
 
-                    tokio::spawn(async move {
+                    let cockpit_task = tokio::spawn(async move {
                         if let Err(e) = cockpit_client.listen().await {
                             eprintln!("Cockpit forward error: {:?}", e);
                         }
                     });
 
-                    return Ok(true);
+                    // Store the task handles
+                    state_guard.ssh_task = Some(ssh_task);
+                    state_guard.cockpit_task = Some(cockpit_task);
+
+                    drop(state_guard); // Release the lock
+
+                    Ok(true)
                 },
                 Err(e) => {
                     eprintln!("Failed to create cockpit client: {:?}", e);
-                    return Ok(false);
+                    Ok(false)
                 }
             }
         },
         Err(e) => {
             eprintln!("Failed to create SSH client: {:?}", e);
-            return Ok(false);
+            Ok(false)
         }
     }
+}
+
+async fn stop_existing_connections(state: Arc<Mutex<ForwarderState>>) {
+    let mut state_guard = state.lock().await;
+    
+    // Abort existing tasks if they exist
+    if let Some(ssh_task) = state_guard.ssh_task.take() {
+        ssh_task.abort();
+    }
+    
+    if let Some(cockpit_task) = state_guard.cockpit_task.take() {
+        cockpit_task.abort();
+    }
+    
+    // Clear client connections
+    state_guard.ssh_client = None;
+    state_guard.cockpit_client = None;
+    
+    println!("Stopped existing connections");
 }
 
 async fn reconnect_clients(state: Arc<Mutex<ForwarderState>>) -> Result<bool> {
